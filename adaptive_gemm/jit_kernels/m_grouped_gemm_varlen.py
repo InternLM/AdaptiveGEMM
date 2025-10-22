@@ -109,8 +109,8 @@ def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: 
     return smem_size
 
 
-def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False) -> Tuple[int, int, int, int, int, int]:
+def _get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
+                      is_grouped_contiguous: bool) -> Tuple[int, int, int, int, int, int]:
     if not is_grouped_contiguous:
         # TODO: for some cases, smaller M block is better, add them into tuning space
         block_ms = (64 if m <= 64 else 128, )
@@ -166,6 +166,18 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     return num_min_sms, best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size
 
 
+@torch.library.custom_op("moe::get_best_configs", mutates_args=())
+def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
+                     is_grouped_contiguous: bool) -> Tuple[int, int, int, int, int, int]:
+    return _get_best_configs(m, n, k, num_groups, num_sms, is_grouped_contiguous)
+
+
+@get_best_configs.register_fake
+def _(m: int, n: int, k: int, num_groups: int, num_sms: int,
+                     is_grouped_contiguous: bool) -> Tuple[int, int, int, int, int, int]:
+    return (128, 128, 32, 3, 8, 1)
+
+
 @torch.library.custom_op("moe::varlen_gmm_fp8", mutates_args=('out', ))
 def varlen_gmm_fp8(
         lhs: Tensor, 
@@ -185,7 +197,7 @@ def varlen_gmm_fp8(
     lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
     m, k = lhs.shape
     num_groups, n, k_ = rhs.shape
-    num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
+    num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = _get_best_configs(m, n, k, 1, num_sms, False)
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m_indices_pad, group_pad_off, token_cumdiff, token_pad_end,
             m, M_pad, num_groups,
@@ -282,7 +294,7 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, to
 
     num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - 24
 
-    num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
+    num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(int(m), int(n), int(k), 1, num_sms, False)
     
     size_per_group_padding = ((size_per_group + block_m - 1) // block_m) * block_m
     group_pad_off = torch.zeros(size_per_group.shape[0] + 1, device = "cuda", dtype = torch.long)

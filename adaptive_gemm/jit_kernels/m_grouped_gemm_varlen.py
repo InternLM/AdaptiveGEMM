@@ -4,7 +4,7 @@ from torch.library import triton_op, wrap_triton
 from typing import Tuple
 
 from .tuner import jit_tuner
-from .utils import get_col_major_tma_aligned_tensor, get_num_sms, ceil_div
+from .utils import get_col_major_tma_aligned_tensor, get_num_sms, ceil_div, DISTRIBUTED_COMMUNICATION_SM
 
 import triton
 import triton.language as tl
@@ -280,7 +280,7 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, to
     # Auto-tuning with compilation
     # global includes, template
 
-    num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - 24
+    num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - DISTRIBUTED_COMMUNICATION_SM
 
     num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
     

@@ -1,6 +1,9 @@
 import torch
+import os
 
 _num_sms = None
+
+DISTRIBUTED_COMMUNICATION_SM = int(os.getenv("DISTRIBUTED_COMMUNICATION_SM", "24"))
 
 
 def set_num_sms(num_sms: int) -> None:

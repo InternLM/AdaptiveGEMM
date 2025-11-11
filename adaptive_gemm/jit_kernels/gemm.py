@@ -2,7 +2,7 @@ import torch
 from typing import Tuple, List
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
+from .utils import get_num_sms, ceil_div, get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout, DISTRIBUTED_COMMUNICATION_SM
 
 # C++ code templates
 includes = ('"adaptive_gemm/fp8_gemm.cuh"', )
@@ -158,7 +158,7 @@ def gemm_fp8_fp8_bf16_nt(lhs: List[torch.Tensor],
 
     # Auto-tuning with compilation
     global includes, template
-    num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - 24
+    num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - DISTRIBUTED_COMMUNICATION_SM
     num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size)
     runtime = jit_tuner.compile_and_tune(

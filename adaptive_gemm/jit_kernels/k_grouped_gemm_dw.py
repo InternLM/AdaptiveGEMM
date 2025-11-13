@@ -3,7 +3,7 @@ import torch
 from typing import Tuple
 
 from .tuner import jit_tuner
-from .utils import get_col_major_tma_aligned_tensor, get_num_sms, DISTRIBUTED_COMMUNICATION_SM
+from .utils import get_col_major_tma_aligned_tensor, get_num_sms
 
 os.environ["DG_DW_DEBUG"] = "1"
 
@@ -170,7 +170,7 @@ def k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
 
     # Auto-tuning with compilation
     global includes, template
-    num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - DISTRIBUTED_COMMUNICATION_SM
+    num_sms = get_num_sms()
     block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, num_groups, num_sms,
                                                                                   is_grouped_contiguous=True)
     args = (lhs, lhs_scales, rhs, rhs_scales, out,

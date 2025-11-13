@@ -188,14 +188,14 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous_op(
     num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
     
     size_per_group_padding = ((size_per_group + block_m - 1) // block_m) * block_m
+    size_per_group_padding_cumsum = size_per_group_padding.cumsum(0)
     group_pad_off = torch.zeros(size_per_group.shape[0] + 1, device = "cuda", dtype = torch.long)
-    group_pad_off[1:] = size_per_group_padding.cumsum(0)
+    group_pad_off[1:] = size_per_group_padding_cumsum
     M_pad = size_per_group_padding.sum()
     token_diff = size_per_group_padding - size_per_group
-    token_cumdiff = token_diff.cumsum(0)
-    token_pad_end = size_per_group_padding.cumsum(0) - token_cumdiff
-    token_cumdiff = token_diff.cumsum(0) - token_diff
-
+    token_diff_cumsum = token_diff.cumsum(0)
+    token_pad_end = size_per_group_padding_cumsum - token_diff_cumsum
+    token_cumdiff = token_diff_cumsum - token_diff
 
     group_indices = torch.arange(num_groups, device='cuda').to(torch.int32)
     repeats = (size_per_group_padding // block_m).to(torch.int32)

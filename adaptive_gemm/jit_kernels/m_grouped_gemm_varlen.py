@@ -1,10 +1,14 @@
 import torch
 from torch import Tensor
-from torch.library import triton_op, wrap_triton
 from typing import Tuple
 
 from .tuner import jit_tuner
-from .utils import get_col_major_tma_aligned_tensor, get_num_sms, ceil_div, DISTRIBUTED_COMMUNICATION_SM
+from .utils import (
+    get_col_major_tma_aligned_tensor,
+    ceil_div,
+    DISTRIBUTED_COMMUNICATION_SM,
+    get_m_alignment_for_contiguous_layout,
+)
 
 import triton
 import triton.language as tl
@@ -166,25 +170,42 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     return num_min_sms, best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size
 
 
-@torch.library.custom_op("moe::varlen_gmm_fp8", mutates_args=('out', ))
-def varlen_gmm_fp8(
-        lhs: Tensor, 
-        lhs_scales: Tensor, 
-        rhs: Tensor, 
-        rhs_scales: Tensor, 
-        out: Tensor, 
-        m_indices_pad: Tensor, 
-        group_pad_off: Tensor, 
-        token_cumdiff: Tensor, 
-        token_pad_end: Tensor,
-        m: int, 
-        M_pad: Tensor, 
-        num_groups: int,
-        num_sms: int) -> None:
-    global includes, template
-    lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
+@torch.library.custom_op("moe::m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous_op", mutates_args=())
+def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous_op(
+        lhs: torch.Tensor,
+        lhs_scales: torch.Tensor,
+        rhs: torch.Tensor,
+        rhs_scales: torch.Tensor,
+        size_per_group: torch.Tensor,
+) -> torch.Tensor:
     m, k = lhs.shape
     num_groups, n, k_ = rhs.shape
+
+    out = torch.empty((m, n), device = "cuda", dtype = torch.bfloat16)
+
+    num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - DISTRIBUTED_COMMUNICATION_SM
+
+    num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
+    
+    size_per_group_padding = ((size_per_group + block_m - 1) // block_m) * block_m
+    group_pad_off = torch.zeros(size_per_group.shape[0] + 1, device = "cuda", dtype = torch.long)
+    group_pad_off[1:] = size_per_group_padding.cumsum(0)
+    M_pad = size_per_group_padding.sum()
+    token_diff = size_per_group_padding - size_per_group
+    token_cumdiff = token_diff.cumsum(0)
+    token_pad_end = size_per_group_padding.cumsum(0) - token_cumdiff
+    token_cumdiff = token_diff.cumsum(0) - token_diff
+
+
+    group_indices = torch.arange(num_groups, device='cuda').to(torch.int32)
+    repeats = (size_per_group_padding // block_m).to(torch.int32)
+    m_indices_pad = torch.empty(m, device = "cuda", dtype = torch.int32)
+    repeat_cum = repeats.cumsum(0)
+
+    repeat_interleave(group_indices, repeats, repeat_cum, m_indices_pad)
+
+    global includes, template
+    lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
     num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m_indices_pad, group_pad_off, token_cumdiff, token_pad_end,
@@ -212,25 +233,22 @@ def varlen_gmm_fp8(
 
     # Run the kernel
     runtime(*args)
-    return
+    
+    return out
 
 
-@varlen_gmm_fp8.register_fake
+@m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous_op.register_fake
 def _(
-        lhs: Tensor, 
-        lhs_scales: Tensor, 
-        rhs: Tensor, 
-        rhs_scales: Tensor, 
-        out: Tensor, 
-        m_indices_pad: Tensor, 
-        group_pad_off: Tensor, 
-        token_cumdiff: Tensor, 
-        token_pad_end: Tensor,
-        m: int, 
-        M_pad: Tensor, 
-        num_groups: int,
-        num_sms: int) -> None:
-    return
+        lhs: torch.Tensor,
+        lhs_scales: torch.Tensor,
+        rhs: torch.Tensor,
+        rhs_scales: torch.Tensor,
+        size_per_group: torch.Tensor,
+) -> torch.Tensor:
+    m, k = lhs.shape
+    num_groups, n, k_ = rhs.shape
+    out = torch.empty((m, n), device = "cuda", dtype = torch.bfloat16)
+    return out
 
 
 def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Tensor],
@@ -257,7 +275,6 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, to
     rhs, rhs_scales = rhs
     m, k = lhs.shape
     num_groups, n, k_ = rhs.shape
-    out = torch.empty((m, n), device = "cuda", dtype = torch.bfloat16)
 
     # Type and shape checks
     # assert (n % 512) == 0 and (k % 512) == 0
@@ -266,7 +283,6 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, to
     assert rhs_scales.shape == (num_groups, (n + 127) // 128, (k + 127) // 128)
     assert lhs.dtype == torch.float8_e4m3fn and lhs_scales.dtype == torch.float32
     assert rhs.dtype == torch.float8_e4m3fn and rhs_scales.dtype == torch.float32
-    assert out.dtype == torch.bfloat16
     assert size_per_group.dtype == torch.long
     lhs = lhs.contiguous()
     rhs = rhs.contiguous()
@@ -277,36 +293,9 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, to
     if m == 0:
         return
 
-    # Auto-tuning with compilation
-    # global includes, template
-
-    num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - DISTRIBUTED_COMMUNICATION_SM
-
-    num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
-    
-    size_per_group_padding = ((size_per_group + block_m - 1) // block_m) * block_m
-    group_pad_off = torch.zeros(size_per_group.shape[0] + 1, device = "cuda", dtype = torch.long)
-    # import pdb; pdb.set_trace()
-    group_pad_off[1:] = size_per_group_padding.cumsum(0)
-    M_pad = size_per_group_padding.sum()
-    token_diff = size_per_group_padding - size_per_group
-    token_cumdiff = token_diff.cumsum(0)
-    token_pad_end = size_per_group_padding.cumsum(0) - token_cumdiff
-    token_cumdiff = token_diff.cumsum(0) - token_diff
-
-
-    group_indices = torch.arange(num_groups, device='cuda').to(torch.int32)
-    repeats = (size_per_group_padding // block_m).to(torch.int32)
-    m_indices_pad = torch.empty(m, device = "cuda", dtype = torch.int32)
-    repeat_cum = repeats.cumsum(0)
-
-    repeat_interleave(group_indices, repeats, repeat_cum, m_indices_pad)
-
-    varlen_gmm_fp8(
-        lhs, lhs_scales, rhs, rhs_scales, out,
-        m_indices_pad, group_pad_off, token_cumdiff, token_pad_end,
-        m, M_pad, num_groups, 
-        num_sms)
+    out = m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous_op(
+        lhs, lhs_scales, rhs, rhs_scales, size_per_group
+    )
     
     return out
 

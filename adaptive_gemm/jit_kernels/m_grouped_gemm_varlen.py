@@ -6,7 +6,7 @@ from .tuner import jit_tuner
 from .utils import (
     get_col_major_tma_aligned_tensor,
     ceil_div,
-    DISTRIBUTED_COMMUNICATION_SM,
+    get_num_sms,
     get_m_alignment_for_contiguous_layout,
 )
 
@@ -183,7 +183,7 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous_op(
 
     out = torch.empty((m, n), device = "cuda", dtype = torch.bfloat16)
 
-    num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - DISTRIBUTED_COMMUNICATION_SM
+    num_sms = get_num_sms()
 
     num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
     

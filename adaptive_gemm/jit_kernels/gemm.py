@@ -148,7 +148,7 @@ def gemm_fp8_fp8_bf16_nt(lhs: List[torch.Tensor],
     # fix qwen3 GatedDeltaNet backward problem when lhs is not contiguous,
     # this would not effect the performance if lhs is already contiguous.
     # for the case that lhs is not contiguous, runnable is more important than low performance
-    lhs= lhs.contiguous()
+    lhs = lhs.contiguous()
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
 
     # LHS scales must be transposed for TMA load, but not for RHS scales

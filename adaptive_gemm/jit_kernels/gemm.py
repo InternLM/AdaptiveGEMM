@@ -145,9 +145,11 @@ def gemm_fp8_fp8_bf16_nt(lhs: List[torch.Tensor],
     assert lhs.dtype == torch.float8_e4m3fn and lhs_scales.dtype == torch.float32
     assert rhs.dtype == torch.float8_e4m3fn and rhs_scales.dtype == torch.float32
     assert out.dtype == torch.bfloat16
-    # fix qwen3 GatedDeltaNet backward problem when lhs is not contiguous,
-    # this would not effect the performance if lhs is already contiguous.
-    # for the case that lhs is not contiguous, runnable is more important than low performance
+    # Make LHS contiguous internally to fix qwen3 GatedDeltaNet backward problems when lhs is not
+    # contiguous. This does not affect performance if lhs is already contiguous.
+    # For the case that lhs is not contiguous, runnable correctness is more important than the
+    # potential overhead of an extra copy. Note: RHS, RHS scales, and OUT are still required to be
+    # contiguous when calling this function.
     lhs = lhs.contiguous()
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
 

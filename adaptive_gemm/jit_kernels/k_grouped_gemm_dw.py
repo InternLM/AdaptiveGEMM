@@ -112,6 +112,83 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     return best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size
 
 
+def _run_k_grouped_gemm_dw_kernel(
+    lhs: torch.Tensor,
+    lhs_scales: torch.Tensor,
+    rhs: torch.Tensor,
+    rhs_scales: torch.Tensor,
+    out: torch.Tensor,
+    k_indices: torch.Tensor,
+) -> None:
+    m, k = lhs.shape
+    n, k_ = rhs.shape
+    num_groups, m_, n_ = out.shape
+    num_groups_ = k_indices.numel()
+
+    assert m == m_ and k == k_ and n == n_ and num_groups == num_groups_
+    assert k % 128 == 0 and k != 0
+    assert lhs_scales.shape == (m, k // 128), f"{lhs_scales.shape}"
+    assert rhs_scales.shape == ((n + 127) // 128, k // 128)
+    assert lhs.dtype == torch.float8_e4m3fn and lhs_scales.dtype == torch.float32
+    assert rhs.dtype == torch.float8_e4m3fn and rhs_scales.dtype == torch.float32
+    assert out.dtype == torch.bfloat16
+    assert k_indices.dtype == torch.int32
+    assert lhs.is_contiguous() and rhs.is_contiguous()
+    assert out.is_contiguous() and k_indices.is_contiguous()
+
+    # LHS scales must be transposed for TMA load, but not for RHS scales
+    lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
+    assert rhs_scales.is_contiguous()
+
+    global includes, template
+    num_sms = get_num_sms()
+    block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(
+        m, n, k, num_groups, num_sms, is_grouped_contiguous=True
+    )
+    args = (
+        lhs,
+        lhs_scales,
+        rhs,
+        rhs_scales,
+        out,
+        k_indices,
+        k,
+        num_groups,
+        torch.cuda.current_stream(),
+        num_sms,
+        smem_size,
+    )
+    runtime = jit_tuner.compile_and_tune(
+        name='k_grouped_gemm_dw_fp8_fp8_bf16_tn',
+        keys={'M': m, 'N': n, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'NUM_GROUPS': num_groups,
+              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast, 'GEMM_TYPE': 'GroupedContiguous'},
+        space=(),
+        includes=includes,
+        arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
+                  ('rhs', torch.float8_e4m3fn), ('rhs_scales', torch.float),
+                  ('out', torch.bfloat16),
+                  ('grouped_layout', torch.int32), ('k', int), ('num_groups', int),
+                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
+        template=template,
+        args=args
+    )
+    runtime(*args)
+
+
+def _iter_nonzero_group_runs(k_indices: torch.Tensor):
+    run_start = None
+    for idx, k_size in enumerate(k_indices.tolist()):
+        if k_size > 0:
+            if run_start is None:
+                run_start = idx
+        elif run_start is not None:
+            yield run_start, idx
+            run_start = None
+
+    if run_start is not None:
+        yield run_start, k_indices.numel()
+
+
 @torch.library.custom_op("moe::k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous", mutates_args=('out', ))
 def k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
     lhs: torch.Tensor,
@@ -141,14 +218,11 @@ def k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
             `k_indices[i]` records the k-dim size of each group,
             which means that the k-dimension of i-th group of the problems is `k_indices[i]`.
     """
-    # lhs, lhs_scales = lhs
-    # rhs, rhs_scales = rhs
     m, k   = lhs.shape
     n, k_  = rhs.shape
     num_groups, m_, n_ = out.shape
     num_groups_ = k_indices.numel()
 
-    # Type and shape checks
     assert m == m_ and k == k_ and n == n_ and num_groups == num_groups_
     assert k % 128 == 0 and k != 0
     assert lhs_scales.shape == (m, k // 128), f"{lhs_scales.shape}"
@@ -160,43 +234,43 @@ def k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
     assert lhs.is_contiguous() and rhs.is_contiguous()
     assert out.is_contiguous() and k_indices.is_contiguous()
 
-    # LHS scales must be transposed for TMA load, but not for RHS scales
-    lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
-    assert rhs_scales.is_contiguous()
+    # The current DW kernel does not always overwrite every output element when given an
+    # uninitialized destination buffer, so start from zeros and let zero-sized groups stay zero.
+    out.zero_()
 
-    # Do nothing if `k` is zero
-    if k == 0:
+    total_group_k = int(k_indices.sum().item())
+    assert total_group_k <= k
+
+    num_nonzero_groups = int(torch.count_nonzero(k_indices).item())
+    if num_nonzero_groups == 0 or total_group_k == 0:
         return
 
-    # Auto-tuning with compilation
-    global includes, template
-    num_sms = get_num_sms()
-    block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, num_groups, num_sms,
-                                                                                  is_grouped_contiguous=True)
-    args = (lhs, lhs_scales, rhs, rhs_scales, out,
-            k_indices, k, num_groups,
-            torch.cuda.current_stream(), num_sms, smem_size)
-    # print(f"args:\n{args}")
-    runtime = jit_tuner.compile_and_tune(
-        name='k_grouped_gemm_dw_fp8_fp8_bf16_tn',
-        keys={'M': m, 'N': n, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'NUM_GROUPS': num_groups,
-              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast, 'GEMM_TYPE': 'GroupedContiguous'},
-        space=(),
-        includes=includes,
-        arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
-                  ('rhs', torch.float8_e4m3fn), ('rhs_scales', torch.float),
-                  ('out', torch.bfloat16),
-                  ('grouped_layout', torch.int32), ('k', int), ('num_groups', int),
-                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-        template=template,
-        args=args
-    )
+    if num_nonzero_groups == num_groups and total_group_k == k:
+        _run_k_grouped_gemm_dw_kernel(lhs, lhs_scales, rhs, rhs_scales, out, k_indices)
+        return
 
-    # for a in args:
-    #     print(a)
+    # Zero-sized groups consume no K columns but still advance the group index seen by Python.
+    # Launching them through the persistent kernel can desynchronize the TMA and math pipelines,
+    # so only dispatch consecutive runs of groups with positive K and leave empty groups zeroed.
+    k_cursor = 0
+    for run_start, run_end in _iter_nonzero_group_runs(k_indices):
+        run_k_indices = k_indices[run_start:run_end].contiguous()
+        run_k = int(run_k_indices.sum().item())
+        run_k_blocks = run_k // 128
+        k_block_start = k_cursor // 128
+        k_block_end = k_block_start + run_k_blocks
 
-    # Run the kernel
-    runtime(*args)
+        _run_k_grouped_gemm_dw_kernel(
+            lhs[:, k_cursor:k_cursor + run_k].contiguous(),
+            lhs_scales[:, k_block_start:k_block_end].contiguous(),
+            rhs[:, k_cursor:k_cursor + run_k].contiguous(),
+            rhs_scales[:, k_block_start:k_block_end].contiguous(),
+            out[run_start:run_end],
+            run_k_indices,
+        )
+        k_cursor += run_k
+
+    assert k_cursor == total_group_k
 
 
 @k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous.register_fake

@@ -26,6 +26,11 @@ def get_jit_include_dir() -> str:
 
 
 @functools.lru_cache(maxsize=None)
+def get_third_party_cutlass_include_dir() -> str:
+    return f'{os.path.dirname(os.path.abspath(__file__))}/../../third-party/cutlass/include'
+
+
+@functools.lru_cache(maxsize=None)
 def get_adaptive_gemm_version() -> str:
     # Update include directories
     include_dir = f'{get_jit_include_dir()}/adaptive_gemm'
@@ -104,6 +109,9 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
     cxx_flags = ['-fPIC', '-O3', '-Wno-deprecated-declarations', '-Wno-abi']
     flags = [*nvcc_flags, f'--compiler-options={",".join(cxx_flags)}']
     include_dirs = [get_jit_include_dir()]
+    third_party_cutlass_include_dir = get_third_party_cutlass_include_dir()
+    if os.path.exists(third_party_cutlass_include_dir):
+        include_dirs.append(third_party_cutlass_include_dir)
 
     # Build signature
     enable_sass_opt = get_nvcc_compiler()[1] <= '12.8' and int(os.getenv('DG_DISABLE_FFMA_INTERLEAVE', 0)) == 0

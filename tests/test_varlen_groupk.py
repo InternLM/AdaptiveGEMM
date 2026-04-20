@@ -1,9 +1,91 @@
 import random
+from pathlib import Path
+import sys
 import torch
 from typing import Tuple
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import adaptive_gemm
 from adaptive_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor
+from adaptive_gemm.jit_kernels.k_grouped_gemm_dw import get_bfloat16_ref, quant_input
+
+
+REPLAY_INPUT_PATH = REPO_ROOT / "dw_kernel_replay_inputs_rank0_0.pt"
+
+
+def _require_sm90() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+
+    major, _ = torch.cuda.get_device_capability()
+    if major < 9:
+        pytest.skip("This kernel requires sm90+")
+
+
+def _run_k_grouped_gemm_dw(
+    lhs: torch.Tensor,
+    lhs_scales: torch.Tensor,
+    rhs: torch.Tensor,
+    rhs_scales: torch.Tensor,
+    k_indices: torch.Tensor,
+) -> torch.Tensor:
+    out = torch.empty((k_indices.numel(), lhs.shape[0], rhs.shape[0]), device="cuda", dtype=torch.bfloat16)
+    adaptive_gemm.k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
+        lhs, lhs_scales, rhs, rhs_scales, out, k_indices
+    )
+    torch.cuda.synchronize()
+    return out
+
+
+def test_k_grouped_gemm_dw_replay_input_is_deterministic() -> None:
+    _require_sm90()
+    if not REPLAY_INPUT_PATH.exists():
+        pytest.skip(f"Missing replay input: {REPLAY_INPUT_PATH}")
+
+    replay = torch.load(REPLAY_INPUT_PATH, map_location="cuda")
+    lhs = replay["grad_out_trans_fp8"].contiguous()
+    lhs_scales = replay["grad_out_trans_scale"].contiguous()
+    rhs = replay["x_trans_quant_fp8"].contiguous()
+    rhs_scales = replay["x_trans_quant_scale"].contiguous()
+    k_indices = replay["tokens_per_expert_expand"].contiguous()
+
+    # Warm up once so both measured calls reuse the same compiled kernel.
+    _run_k_grouped_gemm_dw(lhs, lhs_scales, rhs, rhs_scales, k_indices)
+
+    out_0 = _run_k_grouped_gemm_dw(lhs, lhs_scales, rhs, rhs_scales, k_indices)
+    out_1 = _run_k_grouped_gemm_dw(lhs, lhs_scales, rhs, rhs_scales, k_indices)
+    diff = (out_0.float() - out_1.float()).abs()
+    assert torch.equal(out_0, out_1), (
+        f"Replay input is not deterministic: max_diff={diff.max().item()}, "
+        f"num_diff={diff.ne(0).sum().item()}"
+    )
+
+
+def test_k_grouped_gemm_dw_zero_groups_match_reference() -> None:
+    _require_sm90()
+
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    m, n = 256, 256
+    k_indices = torch.tensor([0, 128, 256, 0, 128, 0, 512], device="cuda", dtype=torch.int32)
+    total_k = int(k_indices.sum().item())
+    lhs = torch.randn((m, total_k), device="cuda", dtype=torch.bfloat16)
+    rhs = torch.randn((n, total_k), device="cuda", dtype=torch.bfloat16)
+
+    (lhs_quant, lhs_scales), (rhs_quant, rhs_scales), k_indices = quant_input(lhs, rhs, k_indices)
+    ref = get_bfloat16_ref((lhs_quant, lhs_scales), (rhs_quant, rhs_scales), k_indices)
+
+    out_0 = _run_k_grouped_gemm_dw(lhs_quant, lhs_scales, rhs_quant, rhs_scales, k_indices)
+    out_1 = _run_k_grouped_gemm_dw(lhs_quant, lhs_scales, rhs_quant, rhs_scales, k_indices)
+
+    assert torch.equal(out_0, out_1), "Zero-group input should be deterministic"
+    assert torch.allclose(out_0, ref, atol=1, rtol=1e-1)
+    assert bool((out_0[k_indices == 0] == 0).all().item())
 
 
 def generate_random_list(length, total_sum):

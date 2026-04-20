@@ -11,7 +11,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import adaptive_gemm
 from adaptive_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor
-from adaptive_gemm.jit_kernels.k_grouped_gemm_dw import get_bfloat16_ref, quant_input
+from adaptive_gemm.jit_kernels.k_grouped_gemm_dw import get_best_configs, get_bfloat16_ref, quant_input
 
 
 REPLAY_INPUT_PATH = REPO_ROOT / "dw_kernel_replay_inputs_rank0_0.pt"
@@ -86,6 +86,16 @@ def test_k_grouped_gemm_dw_zero_groups_match_reference() -> None:
     assert torch.equal(out_0, out_1), "Zero-group input should be deterministic"
     assert torch.allclose(out_0, ref, atol=1, rtol=1e-1)
     assert bool((out_0[k_indices == 0] == 0).all().item())
+
+
+def test_k_grouped_gemm_dw_tuner_avoids_nonuniform_rhs_scale_path() -> None:
+    _require_sm90()
+
+    m, n = 256, 256
+    num_sms = adaptive_gemm.get_num_sms()
+    for num_groups in (4, 7, 9, 11, 13):
+        _, block_n, _, _, _ = get_best_configs(m, n, 128 * num_groups, num_groups, num_sms, True)
+        assert 128 % block_n == 0, f"Autotuner selected unsupported BLOCK_N={block_n}"
 
 
 def generate_random_list(length, total_sum):

@@ -363,7 +363,7 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         float scale_b_0 = __ldg(local_scale_b + k_iter * kNumStages + s), scale_b_1;
                         // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
                         if constexpr (not kMustUseUniformedScaleB)
-                            scale_b_1 = __ldg(local_scale_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
+                            scale_b_1 = ld_shared(local_scale_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
 
                         // Wait TMA arrivals
                         full_barriers[s]->wait((num_iterations_cumsum + k_iter) & 1);
@@ -422,7 +422,7 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         float scale_b_0 = __ldg(local_scale_b + k_iter * kNumStages + s), scale_b_1;
                         // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
                         if constexpr (not kMustUseUniformedScaleB)
-                            scale_b_1 = __ldg(local_scale_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
+                            scale_b_1 = ld_shared(local_scale_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
 
 
                         // Wait TMA arrivals
@@ -536,10 +536,6 @@ public:
         // NOTES: we must use 4 warps to do TMA, because `setmaxnreg.aligned` requires 4 warps
         constexpr uint32_t kNumTMAThreads = 128;
         constexpr uint32_t kNumMathThreadsPerGroup = 128;
-        constexpr uint32_t kNumMBlocks = ceil_div(SHAPE_M, BLOCK_M);
-        constexpr uint32_t kNumNBlocks = ceil_div(SHAPE_N, BLOCK_N);
-        constexpr uint32_t kNumBlocks = kNumGroups * kNumMBlocks * kNumNBlocks;
-        constexpr uint32_t kLaunchBlocks = ceil_div(kNumBlocks, kNumTMAMulticast) * kNumTMAMulticast;
         auto kernel = fp8_gemm_kernel_dw<SHAPE_M, SHAPE_N, BLOCK_M, BLOCK_N, BLOCK_K,
                                       kNumGroups, kNumStages, kNumTMAThreads, kNumMathThreadsPerGroup,
                                       kNumTMAMulticast, kGemmType>;
@@ -547,7 +543,7 @@ public:
 
         // Cluster launch
         cudaLaunchConfig_t config;
-        config.gridDim = (num_sms > static_cast<int>(kLaunchBlocks)) ? num_sms : kLaunchBlocks;
+        config.gridDim = num_sms;
         config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M);
         config.dynamicSmemBytes = smem_size;
         config.stream = stream;

@@ -224,6 +224,10 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     struct NotDivisibleK {};
     auto launch_k_iterations = [](const uint32_t dim_k, const auto& func) {
         auto num_k_iters = ceil_div(dim_k, kFullKOfAllStages);
+        if (dim_k == 0) {
+            func(0, NotDivisibleK{});
+            return;
+        }
         if (dim_k % kFullKOfAllStages == 0) {
             for (int k_iter = 0; k_iter < num_k_iters; ++ k_iter)
                 func(k_iter, DivisibleK{});
@@ -250,7 +254,7 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         if (threadIdx.x == kNumMathThreads) {
             // Persistently schedule over blocks
             while (scheduler.get_next_block(m_block_idx, n_block_idx, curr_k_dim_size)) {
-                auto num_iterations = ceil_div(curr_k_dim_size, kFullKOfAllStages);
+                auto num_iterations = curr_k_dim_size == 0 ? 1 : ceil_div(curr_k_dim_size, kFullKOfAllStages);
                 launch_k_iterations(curr_k_dim_size, [&](int k_iter, auto type) {
                     if constexpr (std::is_same_v<decltype(type), DivisibleK>){
                         #pragma unroll
@@ -354,7 +358,7 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             };
 
             // Launch MMAs
-            auto num_iterations = ceil_div(curr_k_dim_size, kFullKOfAllStages);
+            auto num_iterations = curr_k_dim_size == 0 ? 1 : ceil_div(curr_k_dim_size, kFullKOfAllStages);
             launch_k_iterations(curr_k_dim_size, [&](int k_iter, auto type) {
                 if constexpr (std::is_same_v<decltype(type), DivisibleK>) {
                     #pragma unroll
@@ -504,7 +508,7 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                 cute::tma_store_arrive();
                 cute::tma_store_wait<0>();
             }
-            __syncwarp();
+            cutlass::arch::NamedBarrier(kNumMathThreads).sync();
         }
     }
 #else

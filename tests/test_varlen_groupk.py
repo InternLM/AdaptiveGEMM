@@ -41,6 +41,46 @@ def _run_k_grouped_gemm_dw(
     return out
 
 
+def _get_bfloat16_ref_allow_partial_n(
+    lhs: tuple[torch.Tensor, torch.Tensor],
+    rhs: tuple[torch.Tensor, torch.Tensor],
+    k_indices: torch.Tensor,
+) -> torch.Tensor:
+    lhs_quant, lhs_scales = lhs
+    rhs_quant, rhs_scales = rhs
+    m, k = lhs_quant.shape
+    n, k_ = rhs_quant.shape
+    block_k = 128
+    assert k == k_ and k == int(k_indices.sum().item()) and k % block_k == 0
+
+    lhs_dequant = (
+        lhs_quant.reshape(-1, block_k)
+        .to(torch.float)
+        .mul(lhs_scales.reshape(-1, 1))
+        .reshape(m, k)
+        .to(torch.bfloat16)
+    )
+
+    padded_n = rhs_scales.shape[0] * block_k
+    rhs_padded = torch.zeros((padded_n, k), device=rhs_quant.device, dtype=torch.float)
+    rhs_padded[:n, :] = rhs_quant.to(torch.float)
+    rhs_dequant = (
+        rhs_padded.reshape(padded_n // block_k, block_k, k // block_k, block_k)
+        .transpose(1, 2)
+        .mul(rhs_scales.view(padded_n // block_k, k // block_k, 1, 1))
+        .transpose(1, 2)
+        .reshape(padded_n, k)[:n, :]
+        .to(torch.bfloat16)
+    )
+
+    out = torch.zeros(k_indices.numel(), m, n, dtype=torch.bfloat16, device="cuda")
+    k_start = 0
+    for group_idx, k_size in enumerate(k_indices.tolist()):
+        out[group_idx] = lhs_dequant[:, k_start:k_start + k_size] @ rhs_dequant[:, k_start:k_start + k_size].t()
+        k_start += k_size
+    return out
+
+
 def test_k_grouped_gemm_dw_replay_input_is_deterministic() -> None:
     _require_sm90()
     if not REPLAY_INPUT_PATH.exists():
@@ -72,7 +112,7 @@ def test_k_grouped_gemm_dw_zero_groups_match_reference() -> None:
     torch.cuda.manual_seed(0)
 
     m, n = 256, 256
-    k_indices = torch.tensor([0, 128, 256, 0, 128, 0, 512], device="cuda", dtype=torch.int32)
+    k_indices = torch.tensor([0, 128, 0, 0, 384, 0, 128, 0], device="cuda", dtype=torch.int32)
     total_k = int(k_indices.sum().item())
     lhs = torch.randn((m, total_k), device="cuda", dtype=torch.bfloat16)
     rhs = torch.randn((n, total_k), device="cuda", dtype=torch.bfloat16)
@@ -80,12 +120,57 @@ def test_k_grouped_gemm_dw_zero_groups_match_reference() -> None:
     (lhs_quant, lhs_scales), (rhs_quant, rhs_scales), k_indices = quant_input(lhs, rhs, k_indices)
     ref = get_bfloat16_ref((lhs_quant, lhs_scales), (rhs_quant, rhs_scales), k_indices)
 
-    out_0 = _run_k_grouped_gemm_dw(lhs_quant, lhs_scales, rhs_quant, rhs_scales, k_indices)
-    out_1 = _run_k_grouped_gemm_dw(lhs_quant, lhs_scales, rhs_quant, rhs_scales, k_indices)
+    outputs = [
+        _run_k_grouped_gemm_dw(lhs_quant, lhs_scales, rhs_quant, rhs_scales, k_indices)
+        for _ in range(5)
+    ]
+    out_0 = outputs[0]
 
-    assert torch.equal(out_0, out_1), "Zero-group input should be deterministic"
+    for out in outputs[1:]:
+        assert torch.equal(out_0, out), "Zero-group input should be deterministic"
     assert torch.allclose(out_0, ref, atol=1, rtol=1e-1)
     assert bool((out_0[k_indices == 0] == 0).all().item())
+
+
+def test_k_grouped_gemm_dw_unaligned_group_k_matches_reference() -> None:
+    _require_sm90()
+
+    torch.manual_seed(1)
+    torch.cuda.manual_seed(1)
+
+    m, n = 256, 256
+    raw_k_indices = torch.tensor([1, 127, 129, 255], device="cuda", dtype=torch.int32)
+    total_k = int(raw_k_indices.sum().item())
+    lhs = torch.randn((m, total_k), device="cuda", dtype=torch.bfloat16)
+    rhs = torch.randn((n, total_k), device="cuda", dtype=torch.bfloat16)
+
+    (lhs_quant, lhs_scales), (rhs_quant, rhs_scales), k_indices = quant_input(lhs, rhs, raw_k_indices)
+    ref = get_bfloat16_ref((lhs_quant, lhs_scales), (rhs_quant, rhs_scales), k_indices)
+    out = _run_k_grouped_gemm_dw(lhs_quant, lhs_scales, rhs_quant, rhs_scales, k_indices)
+
+    assert k_indices.tolist() == [128, 128, 256, 256]
+    assert torch.allclose(out, ref, atol=1, rtol=1e-1)
+
+
+def test_k_grouped_gemm_dw_partial_n_tile_matches_reference() -> None:
+    _require_sm90()
+
+    torch.manual_seed(2)
+    torch.cuda.manual_seed(2)
+
+    m, n = 256, 320
+    k_indices = torch.tensor([128, 256, 128], device="cuda", dtype=torch.int32)
+    total_k = int(k_indices.sum().item())
+    lhs = torch.randn((m, total_k), device="cuda", dtype=torch.bfloat16)
+    rhs = torch.randn((n, total_k), device="cuda", dtype=torch.bfloat16)
+
+    (lhs_quant, lhs_scales), (rhs_quant, rhs_scales), k_indices = quant_input(lhs, rhs, k_indices)
+    ref = _get_bfloat16_ref_allow_partial_n((lhs_quant, lhs_scales), (rhs_quant, rhs_scales), k_indices)
+    out = _run_k_grouped_gemm_dw(lhs_quant, lhs_scales, rhs_quant, rhs_scales, k_indices)
+
+    assert n % 128 != 0
+    assert rhs_scales.shape == ((n + 127) // 128, total_k // 128)
+    assert torch.allclose(out, ref, atol=1, rtol=1e-1)
 
 
 def test_k_grouped_gemm_dw_tuner_avoids_nonuniform_rhs_scale_path() -> None:

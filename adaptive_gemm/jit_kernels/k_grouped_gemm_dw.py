@@ -41,7 +41,7 @@ def ceil_div(a, b):
 def is_tma_multicast_legal(n: int, block_n: int, num_tma_multicast: int, num_sms: int) -> bool:
     if num_tma_multicast == 1:
         return True
-    return (n % (block_n * num_tma_multicast) == 0) and num_sms % num_tma_multicast == 0
+    return (ceil_div(n, block_n) % num_tma_multicast == 0) and num_sms % num_tma_multicast == 0
 
 
 def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128) -> int:
@@ -67,9 +67,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     assert is_grouped_contiguous
 
     block_ms = (128, )
-    # The current DW kernel only produces correct results when the N tile size aligns
-    # with the 128-column RHS scale granularity.
-    block_ns = (16, 32, 64, 128)
+    block_ns = tuple(range(16, 129, 8))
 
     fix_wave_saturate = lambda x: num_sms if x == 0 else x
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None)
@@ -105,10 +103,9 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
             break
     assert best_num_stages is not None
 
-    # Decide the number of TMA multicast
-    best_num_tma_multicast = 2
-    # if m >= 1024 and is_tma_multicast_legal(n, best_block_n, 2, num_sms) and num_groups == 1:
-    #     best_num_tma_multicast = 2
+    # Decide the number of TMA multicast. Clustered CTAs share the A tile, so
+    # the N-block schedule must not let a multicast cluster straddle M blocks.
+    best_num_tma_multicast = 2 if is_tma_multicast_legal(n, best_block_n, 2, num_sms) else 1
 
     # print(best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size)
     return best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size
@@ -149,7 +146,7 @@ def k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
     num_groups_ = k_indices.numel()
 
     assert m == m_ and k == k_ and n == n_ and num_groups == num_groups_
-    assert k % 128 == 0 and k != 0
+    assert k % 128 == 0
     assert lhs_scales.shape == (m, k // 128), f"{lhs_scales.shape}"
     assert rhs_scales.shape == ((n + 127) // 128, k // 128)
     assert lhs.dtype == torch.float8_e4m3fn and lhs_scales.dtype == torch.float32
@@ -159,14 +156,9 @@ def k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
     assert lhs.is_contiguous() and rhs.is_contiguous()
     assert out.is_contiguous() and k_indices.is_contiguous()
 
-    total_group_k = int(k_indices.sum().item())
-    assert total_group_k <= k
-
-    num_nonzero_groups = int(torch.count_nonzero(k_indices).item())
-    if num_nonzero_groups == 0 or total_group_k == 0:
+    if k == 0:
         out.zero_()
         return
-
     # LHS scales must be transposed for TMA load, but not for RHS scales
     lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
     assert rhs_scales.is_contiguous()

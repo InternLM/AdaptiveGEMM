@@ -333,6 +333,7 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         // NOTES: use `__shfl_sync` to encourage NVCC to use unified registers
         const auto math_wg_idx = __shfl_sync(0xffffffff, threadIdx.x / kNumMathThreadsPerGroup, 0);
         const auto r_0 = warp_idx * 16 + lane_idx / 4, r_1 = r_0 + 8;
+        bool has_pending_tma_store = false;
 
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx, curr_k_dim_size)) {
@@ -367,7 +368,7 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         float scale_b_0 = __ldg(local_scale_b + k_iter * kNumStages + s), scale_b_1;
                         // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
                         if constexpr (not kMustUseUniformedScaleB)
-                            scale_b_1 = ld_shared(local_scale_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
+                            scale_b_1 = __ldg(local_scale_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
 
                         // Wait TMA arrivals
                         full_barriers[s]->wait((num_iterations_cumsum + k_iter) & 1);
@@ -426,7 +427,7 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         float scale_b_0 = __ldg(local_scale_b + k_iter * kNumStages + s), scale_b_1;
                         // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
                         if constexpr (not kMustUseUniformedScaleB)
-                            scale_b_1 = ld_shared(local_scale_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
+                            scale_b_1 = __ldg(local_scale_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
 
 
                         // Wait TMA arrivals
@@ -480,6 +481,15 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             });
             num_iterations_cumsum += num_iterations;
 
+            // The previous async TMA store may still be reading smem_d. Let it
+            // overlap with this tile's math, but wait before reusing smem_d.
+            if (has_pending_tma_store) {
+                    if (threadIdx.x == 0) {
+                        cute::tma_store_wait<0>();
+                    }
+                    cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+                    has_pending_tma_store = false;
+                }
             // Write back to shared memory using STSM
             DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
             #pragma unroll
@@ -506,9 +516,12 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             if (threadIdx.x == 0) {
                 cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, n_block_idx * BLOCK_N, scheduler.curr_group_idx * SHAPE_M + m_block_idx * BLOCK_M);
                 cute::tma_store_arrive();
-                cute::tma_store_wait<0>();
             }
-            cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+            has_pending_tma_store = true;
+        }
+
+        if (has_pending_tma_store && threadIdx.x == 0) {
+            cute::tma_store_wait<0>();
         }
     }
 #else

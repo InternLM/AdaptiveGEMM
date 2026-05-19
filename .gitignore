@@ -12,4 +12,4 @@ adaptive_gemm/include/cutlass
 
 # local artifacts
 .venv/
-dw_kernel_replay_inputs_rank0_0.pt
+*.pt

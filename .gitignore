@@ -9,3 +9,7 @@ dist
 # Third-party links created by `setup.py develop`
 adaptive_gemm/include/cute
 adaptive_gemm/include/cutlass
+
+# local artifacts
+.venv/
+*.pt

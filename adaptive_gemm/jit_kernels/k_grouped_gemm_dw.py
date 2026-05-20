@@ -41,7 +41,7 @@ def ceil_div(a, b):
 def is_tma_multicast_legal(n: int, block_n: int, num_tma_multicast: int, num_sms: int) -> bool:
     if num_tma_multicast == 1:
         return True
-    return (n % (block_n * num_tma_multicast) == 0) and num_sms % num_tma_multicast == 0
+    return (ceil_div(n, block_n) % num_tma_multicast == 0) and num_sms % num_tma_multicast == 0
 
 
 def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128) -> int:
@@ -103,10 +103,9 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
             break
     assert best_num_stages is not None
 
-    # Decide the number of TMA multicast
-    best_num_tma_multicast = 2
-    # if m >= 1024 and is_tma_multicast_legal(n, best_block_n, 2, num_sms) and num_groups == 1:
-    #     best_num_tma_multicast = 2
+    # Decide the number of TMA multicast. Clustered CTAs share the A tile, so
+    # the N-block schedule must not let a multicast cluster straddle M blocks.
+    best_num_tma_multicast = 2 if is_tma_multicast_legal(n, best_block_n, 2, num_sms) else 1
 
     # print(best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size)
     return best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size
@@ -141,16 +140,13 @@ def k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
             `k_indices[i]` records the k-dim size of each group,
             which means that the k-dimension of i-th group of the problems is `k_indices[i]`.
     """
-    # lhs, lhs_scales = lhs
-    # rhs, rhs_scales = rhs
     m, k   = lhs.shape
     n, k_  = rhs.shape
     num_groups, m_, n_ = out.shape
     num_groups_ = k_indices.numel()
 
-    # Type and shape checks
     assert m == m_ and k == k_ and n == n_ and num_groups == num_groups_
-    assert k % 128 == 0 and k != 0
+    assert k % 128 == 0
     assert lhs_scales.shape == (m, k // 128), f"{lhs_scales.shape}"
     assert rhs_scales.shape == ((n + 127) // 128, k // 128)
     assert lhs.dtype == torch.float8_e4m3fn and lhs_scales.dtype == torch.float32
@@ -160,23 +156,31 @@ def k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
     assert lhs.is_contiguous() and rhs.is_contiguous()
     assert out.is_contiguous() and k_indices.is_contiguous()
 
+    if k == 0:
+        out.zero_()
+        return
     # LHS scales must be transposed for TMA load, but not for RHS scales
     lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
     assert rhs_scales.is_contiguous()
 
-    # Do nothing if `k` is zero
-    if k == 0:
-        return
-
-    # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, num_groups, num_sms,
-                                                                                  is_grouped_contiguous=True)
-    args = (lhs, lhs_scales, rhs, rhs_scales, out,
-            k_indices, k, num_groups,
-            torch.cuda.current_stream(), num_sms, smem_size)
-    # print(f"args:\n{args}")
+    block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(
+        m, n, k, num_groups, num_sms, is_grouped_contiguous=True
+    )
+    args = (
+        lhs,
+        lhs_scales,
+        rhs,
+        rhs_scales,
+        out,
+        k_indices,
+        k,
+        num_groups,
+        torch.cuda.current_stream(),
+        num_sms,
+        smem_size,
+    )
     runtime = jit_tuner.compile_and_tune(
         name='k_grouped_gemm_dw_fp8_fp8_bf16_tn',
         keys={'M': m, 'N': n, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'NUM_GROUPS': num_groups,
@@ -191,11 +195,6 @@ def k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
         template=template,
         args=args
     )
-
-    # for a in args:
-    #     print(a)
-
-    # Run the kernel
     runtime(*args)
 
 

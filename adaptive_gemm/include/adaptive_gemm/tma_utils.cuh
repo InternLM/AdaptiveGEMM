@@ -9,6 +9,11 @@
 
 #include "utils.cuh"
 
+// CUDA 13.2 exposes only the versioned typedef for this driver entry point.
+#ifndef PFN_cuTensorMapEncodeTiled
+#define PFN_cuTensorMapEncodeTiled PFN_cuTensorMapEncodeTiled_v12000
+#endif
+
 namespace adaptive_gemm {
 
 template <class T>
